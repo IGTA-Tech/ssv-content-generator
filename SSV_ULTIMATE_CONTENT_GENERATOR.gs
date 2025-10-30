@@ -464,7 +464,7 @@ function generateDailyContent() {
   Logger.log('════════════════════════════════════════════════════════════════════════');
   Logger.log('🚀 SSV CONTENT GENERATION START v6.0');
   Logger.log('════════════════════════════════════════════════════════════════════════');
-  Logger.log(`📅 ${Utilities.formatDate(startTime, 'America/New_York', 'yyyy-MM-dd HH:mm:ss EST')}`);
+  Logger.log(`📅 ${Utilities.formatDate(startTime, 'America/New_York', 'yyyy-MM-dd HH:mm:ss')} EST`);
   Logger.log(`🆔 Execution ID: ${executionId}`);
   Logger.log('════════════════════════════════════════════════════════════════════════');
 
