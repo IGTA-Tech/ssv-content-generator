@@ -48,9 +48,9 @@ const SSV_CONFIG = {
   MIN_WORD_COUNT: 1500,
   MAX_WORD_COUNT: 3000,
 
-  // Processing limits
-  MAX_RETRIES: 3,
-  RETRY_DELAY_MS: 5000,
+  // Processing limits - AGGRESSIVE PERSISTENCE
+  MAX_RETRIES: 10,  // Try 10 times before giving up
+  RETRY_DELAY_MS: 3000,  // 3 seconds between attempts
   SCRAPING_DELAY_MS: 1000,
   IMAGE_DELAY_MS: 15000,
 
@@ -773,31 +773,79 @@ Be specific with dates. Return REAL news, not generic statements.`;
 
 function generateArticlesWithQualityCheck(config, websiteData, currentEvents) {
   let attempt = 0;
+  const originalThreshold = config.CONFIDENCE_THRESHOLD;
+  const originalMinWords = config.MIN_WORD_COUNT;
+
+  Logger.log(`  🎯 Starting PERSISTENT generation (${config.MAX_RETRIES} max attempts)`);
+  Logger.log(`  📊 Initial confidence threshold: ${originalThreshold}%`);
 
   while (attempt < config.MAX_RETRIES) {
     attempt++;
-    Logger.log(`  📝 Generation attempt ${attempt}/${config.MAX_RETRIES}`);
+
+    // PROGRESSIVE STRATEGY - Get more lenient as we retry
+    let strategyName = 'STRICT';
+    let adjustedConfig = {...config};
+
+    if (attempt <= 3) {
+      // Attempts 1-3: STRICT - Full quality requirements
+      strategyName = 'STRICT';
+      adjustedConfig.CONFIDENCE_THRESHOLD = originalThreshold;  // 90%
+      adjustedConfig.TEMPERATURE = 0.7;
+    } else if (attempt <= 6) {
+      // Attempts 4-6: MEDIUM - Slightly relaxed
+      strategyName = 'MEDIUM';
+      adjustedConfig.CONFIDENCE_THRESHOLD = Math.max(85, originalThreshold - 5);  // 85%
+      adjustedConfig.TEMPERATURE = 0.8;
+      Logger.log(`  🔄 Switching to MEDIUM strategy (${adjustedConfig.CONFIDENCE_THRESHOLD}% threshold)`);
+    } else {
+      // Attempts 7-10: LENIENT - More relaxed but still quality
+      strategyName = 'LENIENT';
+      adjustedConfig.CONFIDENCE_THRESHOLD = Math.max(80, originalThreshold - 10);  // 80%
+      adjustedConfig.TEMPERATURE = 0.9;
+      adjustedConfig.MIN_WORD_COUNT = Math.max(1200, originalMinWords - 300);  // Allow shorter
+      Logger.log(`  🔄 Switching to LENIENT strategy (${adjustedConfig.CONFIDENCE_THRESHOLD}% threshold, ${adjustedConfig.MIN_WORD_COUNT}+ words)`);
+    }
+
+    Logger.log(`  📝 Generation attempt ${attempt}/${config.MAX_RETRIES} [${strategyName}]`);
 
     try {
-      const articles = generateArticles(config, websiteData, currentEvents, attempt);
+      const articles = generateArticles(adjustedConfig, websiteData, currentEvents, attempt, strategyName);
 
-      // Strict validation
-      const validation = strictValidation(articles, config, websiteData);
+      // Validate quality with adjusted config
+      const validation = strictValidation(articles, adjustedConfig, websiteData);
 
       if (validation.passed) {
-        Logger.log(`  ✅ Articles passed validation (attempt ${attempt})`);
+        Logger.log(`  ✅ Quality validation PASSED on attempt ${attempt}!`);
+        Logger.log(`  🎯 Strategy: ${strategyName}, Confidence threshold: ${adjustedConfig.CONFIDENCE_THRESHOLD}%`);
+
+        // Restore original config values for return
+        articles._generationAttempts = attempt;
+        articles._strategy = strategyName;
+
         return articles;
       } else {
         Logger.log(`  ⚠️ Validation failed: ${validation.reason}`);
 
         if (attempt < config.MAX_RETRIES) {
-          Logger.log(`  🔄 Retrying in ${config.RETRY_DELAY_MS}ms...`);
+          Logger.log(`  🔄 Retrying in ${config.RETRY_DELAY_MS}ms... (${config.MAX_RETRIES - attempt} attempts left)`);
           Utilities.sleep(config.RETRY_DELAY_MS);
         }
       }
 
     } catch (e) {
-      Logger.log(`  ❌ Generation error: ${e.toString()}`);
+      const errorMsg = e.toString();
+      Logger.log(`  ❌ Generation error on attempt ${attempt}: ${errorMsg}`);
+
+      // If API error, provide specific guidance
+      if (errorMsg.includes('AUTHENTICATION') || errorMsg.includes('401')) {
+        Logger.log(`  🚨 CRITICAL: API authentication failed - check API key!`);
+        throw e;  // Don't retry auth errors
+      } else if (errorMsg.includes('RATE LIMIT') || errorMsg.includes('429')) {
+        Logger.log(`  ⏳ Rate limit hit - waiting longer before retry...`);
+        Utilities.sleep(10000);  // Wait 10 seconds for rate limits
+      } else {
+        Logger.log(`  🔄 Will retry with different approach...`);
+      }
 
       if (attempt < config.MAX_RETRIES) {
         Utilities.sleep(config.RETRY_DELAY_MS);
@@ -805,10 +853,11 @@ function generateArticlesWithQualityCheck(config, websiteData, currentEvents) {
     }
   }
 
-  throw new Error(`❌ Failed to generate quality articles after ${config.MAX_RETRIES} attempts`);
+  // If we get here, all attempts failed
+  throw new Error(`❌ Failed to generate quality articles after ${config.MAX_RETRIES} attempts with STRICT, MEDIUM, and LENIENT strategies. Check Error_Log and Apps Script logs for details.`);
 }
 
-function generateArticles(config, websiteData, currentEvents, attempt) {
+function generateArticles(config, websiteData, currentEvents, attempt, strategyName) {
 
   // Validate API key first
   if (!config.ANTHROPIC_API_KEY || config.ANTHROPIC_API_KEY === '') {
@@ -816,6 +865,7 @@ function generateArticles(config, websiteData, currentEvents, attempt) {
   }
 
   Logger.log(`    🔑 API Key: ${config.ANTHROPIC_API_KEY.substring(0, 15)}...`);
+  Logger.log(`    🎲 Temperature: ${config.TEMPERATURE || 0.7}`);
 
   const masterPrompt = `You are the premium content generation system for Sherrod Sports Visas. Generate 2 exceptional blog articles for ${config.TODAY}.
 
@@ -925,7 +975,7 @@ Generate exceptional content matching the example quality NOW.`;
       payload: JSON.stringify({
         model: 'claude-3-5-sonnet-20241022',
         max_tokens: 8000,
-        temperature: 0.7,
+        temperature: config.TEMPERATURE || 0.7,  // Use adjusted temperature from strategy
         messages: [{
           role: 'user',
           content: masterPrompt
