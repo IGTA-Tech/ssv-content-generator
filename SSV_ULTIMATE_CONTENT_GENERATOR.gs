@@ -810,6 +810,13 @@ function generateArticlesWithQualityCheck(config, websiteData, currentEvents) {
 
 function generateArticles(config, websiteData, currentEvents, attempt) {
 
+  // Validate API key first
+  if (!config.ANTHROPIC_API_KEY || config.ANTHROPIC_API_KEY === '') {
+    throw new Error('❌ ANTHROPIC_API_KEY is missing or empty. Check Project Settings → Script Properties.');
+  }
+
+  Logger.log(`    🔑 API Key: ${config.ANTHROPIC_API_KEY.substring(0, 15)}...`);
+
   const masterPrompt = `You are the premium content generation system for Sherrod Sports Visas. Generate 2 exceptional blog articles for ${config.TODAY}.
 
 ══════════════════════════════════════════════════════════════════════
@@ -904,32 +911,84 @@ SELF-VERIFY CHECKLIST:
 
 Generate exceptional content matching the example quality NOW.`;
 
-  const response = UrlFetchApp.fetch('https://api.anthropic.com/v1/messages', {
-    method: 'post',
-    headers: {
-      'x-api-key': config.ANTHROPIC_API_KEY,
-      'anthropic-version': '2023-06-01',
-      'content-type': 'application/json'
-    },
-    payload: JSON.stringify({
-      model: 'claude-3-5-sonnet-20241022',
-      max_tokens: 8000,
-      temperature: 0.7,
-      messages: [{
-        role: 'user',
-        content: masterPrompt
-      }]
-    }),
-    muteHttpExceptions: true
-  });
+  Logger.log(`    📡 Calling Claude API (max_tokens: 8000)...`);
 
-  const data = JSON.parse(response.getContentText());
-
-  if (!data.content || !data.content[0]) {
-    throw new Error('No response from Claude API');
+  let response;
+  try {
+    response = UrlFetchApp.fetch('https://api.anthropic.com/v1/messages', {
+      method: 'post',
+      headers: {
+        'x-api-key': config.ANTHROPIC_API_KEY,
+        'anthropic-version': '2023-06-01',
+        'content-type': 'application/json'
+      },
+      payload: JSON.stringify({
+        model: 'claude-3-5-sonnet-20241022',
+        max_tokens: 8000,
+        temperature: 0.7,
+        messages: [{
+          role: 'user',
+          content: masterPrompt
+        }]
+      }),
+      muteHttpExceptions: true
+    });
+  } catch (fetchError) {
+    Logger.log(`    ❌ HTTP request failed: ${fetchError.toString()}`);
+    throw new Error(`Network error calling Claude API: ${fetchError.message}`);
   }
 
-  // Parse JSON
+  const statusCode = response.getResponseCode();
+  const responseText = response.getContentText();
+
+  Logger.log(`    📥 API Response Status: ${statusCode}`);
+
+  if (statusCode !== 200) {
+    Logger.log(`    ❌ API Error Response: ${responseText}`);
+
+    let errorMessage = `Claude API returned ${statusCode}`;
+    try {
+      const errorData = JSON.parse(responseText);
+      if (errorData.error && errorData.error.message) {
+        errorMessage += `: ${errorData.error.message}`;
+      }
+      if (errorData.error && errorData.error.type) {
+        errorMessage += ` (${errorData.error.type})`;
+      }
+    } catch (e) {
+      errorMessage += `. Response: ${responseText.substring(0, 200)}`;
+    }
+
+    if (statusCode === 401) {
+      throw new Error(`❌ AUTHENTICATION FAILED: Invalid ANTHROPIC_API_KEY. Check your API key in Project Settings → Script Properties. Key should start with 'sk-ant-'.`);
+    } else if (statusCode === 429) {
+      throw new Error(`❌ RATE LIMIT: Too many requests to Claude API. Wait a few minutes and try again, or check your API usage limits.`);
+    } else if (statusCode === 400) {
+      throw new Error(`❌ BAD REQUEST: ${errorMessage}. Check the prompt format or API parameters.`);
+    } else {
+      throw new Error(`❌ API ERROR: ${errorMessage}`);
+    }
+  }
+
+  Logger.log(`    ✅ API call successful, parsing response...`);
+
+  let data;
+  try {
+    data = JSON.parse(responseText);
+  } catch (parseError) {
+    Logger.log(`    ❌ JSON parse error: ${parseError.toString()}`);
+    Logger.log(`    Response preview: ${responseText.substring(0, 500)}`);
+    throw new Error(`Failed to parse API response as JSON: ${parseError.message}`);
+  }
+
+  if (!data.content || !data.content[0] || !data.content[0].text) {
+    Logger.log(`    ❌ Unexpected API response structure: ${JSON.stringify(data).substring(0, 500)}`);
+    throw new Error('Claude API response missing content. Check API response structure.');
+  }
+
+  Logger.log(`    ✅ Response received (${data.content[0].text.length} chars), extracting articles...`);
+
+  // Parse JSON from Claude's response
   let jsonText = data.content[0].text;
   jsonText = jsonText.replace(/```json\s*/g, '').replace(/```\s*/g, '');
 
@@ -937,17 +996,31 @@ Generate exceptional content matching the example quality NOW.`;
   const jsonEnd = jsonText.lastIndexOf('}');
 
   if (jsonStart === -1 || jsonEnd === -1) {
-    throw new Error('No valid JSON in response');
+    Logger.log(`    ❌ No JSON found in response`);
+    Logger.log(`    Response preview: ${jsonText.substring(0, 500)}`);
+    throw new Error('No valid JSON object found in Claude response. Check prompt format.');
   }
 
-  const articles = JSON.parse(jsonText.substring(jsonStart, jsonEnd + 1));
+  const jsonString = jsonText.substring(jsonStart, jsonEnd + 1);
+  Logger.log(`    ✅ JSON extracted (${jsonString.length} chars), parsing...`);
+
+  let articles;
+  try {
+    articles = JSON.parse(jsonString);
+  } catch (articleParseError) {
+    Logger.log(`    ❌ Failed to parse articles JSON: ${articleParseError.toString()}`);
+    Logger.log(`    JSON preview: ${jsonString.substring(0, 500)}`);
+    throw new Error(`Failed to parse articles from Claude response: ${articleParseError.message}`);
+  }
 
   if (!articles.article1 || !articles.article2) {
-    throw new Error('Invalid article structure');
+    Logger.log(`    ❌ Missing article1 or article2 in parsed JSON`);
+    Logger.log(`    Keys found: ${Object.keys(articles).join(', ')}`);
+    throw new Error('Articles JSON missing article1 or article2 fields. Claude did not return proper structure.');
   }
 
-  Logger.log(`    ✓ Article 1: "${articles.article1.title}" (${articles.article1.wordCount}w, ${articles.article1.confidence}%)`);
-  Logger.log(`    ✓ Article 2: "${articles.article2.title}" (${articles.article2.wordCount}w, ${articles.article2.confidence}%)`);
+  Logger.log(`    ✅ Article 1: "${articles.article1.title || 'NO TITLE'}" (${articles.article1.wordCount || 0}w, ${articles.article1.confidence || 0}%)`);
+  Logger.log(`    ✅ Article 2: "${articles.article2.title || 'NO TITLE'}" (${articles.article2.wordCount || 0}w, ${articles.article2.confidence || 0}%)`);
 
   return articles;
 }
@@ -969,48 +1042,89 @@ function strictValidation(articles, config, websiteData) {
 }
 
 function validateArticle(article, num, config, websiteData) {
-  // Confidence check
-  if (article.confidence < config.CONFIDENCE_THRESHOLD) {
-    return { passed: false, reason: `Confidence ${article.confidence}% < ${config.CONFIDENCE_THRESHOLD}%` };
+  Logger.log(`      Validating Article ${num}...`);
+
+  // Check article structure
+  if (!article.title) {
+    Logger.log(`      ❌ Missing title field`);
+    return { passed: false, reason: `Article ${num}: Missing title field` };
   }
 
-  // Word count
-  if (article.wordCount < config.MIN_WORD_COUNT || article.wordCount > config.MAX_WORD_COUNT) {
-    return { passed: false, reason: `Word count ${article.wordCount} out of range (${config.MIN_WORD_COUNT}-${config.MAX_WORD_COUNT})` };
+  if (!article.content) {
+    Logger.log(`      ❌ Missing content field`);
+    return { passed: false, reason: `Article ${num}: Missing content field` };
   }
+
+  if (!article.metaDescription) {
+    Logger.log(`      ❌ Missing metaDescription field`);
+    return { passed: false, reason: `Article ${num}: Missing metaDescription field` };
+  }
+
+  // Confidence check
+  if (!article.confidence || article.confidence < config.CONFIDENCE_THRESHOLD) {
+    Logger.log(`      ❌ Confidence too low: ${article.confidence}% < ${config.CONFIDENCE_THRESHOLD}%`);
+    return { passed: false, reason: `Article ${num}: Confidence ${article.confidence}% < ${config.CONFIDENCE_THRESHOLD}%` };
+  }
+  Logger.log(`      ✓ Confidence: ${article.confidence}%`);
+
+  // Word count
+  if (!article.wordCount || article.wordCount < config.MIN_WORD_COUNT || article.wordCount > config.MAX_WORD_COUNT) {
+    Logger.log(`      ❌ Word count out of range: ${article.wordCount} (need ${config.MIN_WORD_COUNT}-${config.MAX_WORD_COUNT})`);
+    return { passed: false, reason: `Article ${num}: Word count ${article.wordCount} out of range (${config.MIN_WORD_COUNT}-${config.MAX_WORD_COUNT})` };
+  }
+  Logger.log(`      ✓ Word count: ${article.wordCount}`);
 
   // Title length
   if (article.title.length > 60) {
-    return { passed: false, reason: `Title too long (${article.title.length} > 60)` };
+    Logger.log(`      ❌ Title too long: ${article.title.length} chars > 60`);
+    return { passed: false, reason: `Article ${num}: Title too long (${article.title.length} > 60 chars)` };
   }
+  Logger.log(`      ✓ Title length: ${article.title.length} chars`);
 
   // Meta description EXACTLY 155
   if (article.metaDescription.length !== 155) {
-    return { passed: false, reason: `Meta must be exactly 155 chars (is ${article.metaDescription.length})` };
+    Logger.log(`      ❌ Meta description wrong length: ${article.metaDescription.length} (must be exactly 155)`);
+    return { passed: false, reason: `Article ${num}: Meta must be exactly 155 chars (is ${article.metaDescription.length})` };
   }
+  Logger.log(`      ✓ Meta description: 155 chars`);
 
   // Name verification (BIGGEST CONCERN from video)
+  if (!article.namesUsed || !Array.isArray(article.namesUsed)) {
+    Logger.log(`      ❌ namesUsed field missing or invalid`);
+    return { passed: false, reason: `Article ${num}: namesUsed field missing or not an array` };
+  }
+
   for (const name of article.namesUsed) {
     if (!websiteData.names.includes(name)) {
-      return { passed: false, reason: `UNVERIFIED NAME: "${name}" - not in approved list` };
+      Logger.log(`      ❌ UNVERIFIED NAME FOUND: "${name}"`);
+      Logger.log(`      📋 Approved names: ${websiteData.names.join(', ')}`);
+      return { passed: false, reason: `Article ${num}: UNVERIFIED NAME: "${name}" - not in approved list. This is CRITICAL.` };
     }
   }
+  Logger.log(`      ✓ All names verified: ${article.namesUsed.join(', ')}`);
 
   // Attorney name check
   if (article.content.toLowerCase().includes('sherrod') && !article.content.includes('Sherrod Seward')) {
-    return { passed: false, reason: 'Attorney name misspelled - must be "Sherrod Seward"' };
+    Logger.log(`      ❌ Attorney name misspelled (must be "Sherrod Seward")`);
+    return { passed: false, reason: `Article ${num}: Attorney name misspelled - must be "Sherrod Seward"` };
   }
+  Logger.log(`      ✓ Attorney name correct`);
 
   // Required headings
   if (!article.content.includes('#') || !article.content.includes('##')) {
-    return { passed: false, reason: 'Missing H1 or H2 headings' };
+    Logger.log(`      ❌ Missing required heading structure (H1/H2)`);
+    return { passed: false, reason: `Article ${num}: Missing H1 or H2 headings` };
   }
+  Logger.log(`      ✓ Heading structure present`);
 
   // Image context check (new requirement)
   if (!article.imageContext || article.imageContext.length < 50) {
-    return { passed: false, reason: 'Image context too vague or missing' };
+    Logger.log(`      ❌ Image context too vague: ${article.imageContext ? article.imageContext.length : 0} chars`);
+    return { passed: false, reason: `Article ${num}: Image context too vague or missing (need 50+ chars)` };
   }
+  Logger.log(`      ✓ Image context: ${article.imageContext.length} chars`);
 
+  Logger.log(`      ✅ Article ${num} validation PASSED`);
   return { passed: true, reason: '' };
 }
 
@@ -1332,13 +1446,75 @@ function logErrorToSheet(error, executionId, duration) {
 function sendErrorAlertEmail(error, executionId, duration) {
   try {
     const config = getConfig();
+
+    // Provide specific troubleshooting based on error message
+    let troubleshooting = '';
+    const errorMsg = error.message || error.toString();
+
+    if (errorMsg.includes('ANTHROPIC_API_KEY') || errorMsg.includes('401') || errorMsg.includes('AUTHENTICATION')) {
+      troubleshooting = '\n\n🔧 TROUBLESHOOTING:\n' +
+        '1. Go to Apps Script → Project Settings (gear icon)\n' +
+        '2. Check Script Properties section\n' +
+        '3. Verify ANTHROPIC_API_KEY exists and starts with "sk-ant-"\n' +
+        '4. Get new key from https://console.anthropic.com/\n' +
+        '5. Make sure you have API credits';
+    } else if (errorMsg.includes('429') || errorMsg.includes('RATE LIMIT')) {
+      troubleshooting = '\n\n🔧 TROUBLESHOOTING:\n' +
+        '1. Wait 15-30 minutes before trying again\n' +
+        '2. Check your Claude API usage at https://console.anthropic.com/\n' +
+        '3. Verify you haven\'t exceeded rate limits\n' +
+        '4. Consider upgrading your API tier';
+    } else if (errorMsg.includes('UNVERIFIED NAME')) {
+      const nameMatch = errorMsg.match(/"([^"]+)"/);
+      const problemName = nameMatch ? nameMatch[1] : 'unknown';
+      troubleshooting = '\n\n🔧 TROUBLESHOOTING:\n' +
+        `1. The name "${problemName}" is not in the Verified_Names sheet\n` +
+        '2. Open Verified_Names sheet and check approved names\n' +
+        '3. Either add this name manually if valid, or\n' +
+        '4. Run the Name Extraction Tool to update names from website\n' +
+        '5. System will automatically retry with different content';
+    } else if (errorMsg.includes('confidence') || errorMsg.includes('Confidence')) {
+      troubleshooting = '\n\n🔧 TROUBLESHOOTING:\n' +
+        '1. Claude generated low-confidence content\n' +
+        '2. Check Config sheet - CONFIDENCE_THRESHOLD setting\n' +
+        '3. Add more examples to Website_URLs sheet\n' +
+        '4. System will automatically retry (3 attempts total)\n' +
+        '5. If persists, may need to adjust quality threshold';
+    } else if (errorMsg.includes('JSON') || errorMsg.includes('parse')) {
+      troubleshooting = '\n\n🔧 TROUBLESHOOTING:\n' +
+        '1. Claude API returned invalid format\n' +
+        '2. This is usually temporary - will work on retry\n' +
+        '3. Check Apps Script logs for response preview\n' +
+        '4. System will retry automatically\n' +
+        '5. If persists, check Claude API status';
+    } else if (errorMsg.includes('Network') || errorMsg.includes('timeout')) {
+      troubleshooting = '\n\n🔧 TROUBLESHOOTING:\n' +
+        '1. Network connection issue\n' +
+        '2. This is usually temporary\n' +
+        '3. System will retry tomorrow at 4 AM\n' +
+        '4. Check https://status.anthropic.com/ for API status';
+    } else {
+      troubleshooting = '\n\n🔧 TROUBLESHOOTING:\n' +
+        '1. Check Error_Log sheet for full details\n' +
+        '2. Review Apps Script logs (Executions tab)\n' +
+        '3. Verify all Script Properties are set correctly\n' +
+        '4. Test manually: SSV Content → Generate Content Now\n' +
+        '5. Contact support if issue persists';
+    }
+
     const body = 'SSV CONTENT GENERATION FAILURE ALERT\n\n' +
       'Execution ID: ' + executionId + '\n' +
       'Failed At: ' + new Date() + '\n' +
       'Duration: ' + duration + ' seconds\n\n' +
-      'ERROR:\n' + error.message + '\n\n' +
-      'Check Error_Log sheet for details.\n' +
-      'System will retry tomorrow at 4 AM EST.';
+      'ERROR:\n' + errorMsg + '\n' +
+      troubleshooting + '\n\n' +
+      '📋 NEXT STEPS:\n' +
+      '1. Check Error_Log sheet for details\n' +
+      '2. Review Apps Script logs (Extensions → Apps Script → Executions)\n' +
+      '3. System will retry tomorrow at 4 AM EST\n' +
+      '4. Or run manually: SSV Content → Generate Content Now\n\n' +
+      '📚 Documentation:\n' +
+      'https://github.com/IGTA-Tech/ssv-content-generator';
 
     MailApp.sendEmail({
       to: config.EMAIL_RECIPIENTS,
